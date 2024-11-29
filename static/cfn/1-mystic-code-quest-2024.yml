@@ -1,0 +1,413 @@
+# Copyright 2024 Amazon.com and its affiliates; all rights reserved.
+# This file is Amazon Web Services Content and may not be duplicated or distributed without permission.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Mystic CodeQuest 2024
+
+Parameters:
+  # These parameters are supplied by the Quests API when this template is deployed
+  DeployAssetsBucket:
+    # Default: ee-assets-prod-us-east-1
+    Description: The name of the S3 bucket where assets are stored
+    Type: String
+  DeployAssetsKeyPrefix:
+    # Default: modules/9c0e89820b864addaed45ec2f5440379/v5/
+    Description: S3 key prefix where assets are stored
+    Type: String
+
+  # Additional parameters required by this template
+  QuestId:
+    Default: ad8fc86d-cd69-4e66-bbae-4c7c208d870e
+    Description: The ID assigned to this Quest
+    Type: String
+
+  TeamLambdaSourceKey:
+    Default: gdQuests-team-lambda-source.zip
+    Description: S3 key for the Lambda source code used by the team account for the Quest
+    Type: String
+  StaticAssetsBucket:
+    Type: String
+    Description: (Optional) Bucket for static assets that live outside of the
+      pipeline (e.g. data for seeding)
+    Default: ""
+  StaticAssetsKeyPrefix:
+    Type: String
+    Description:
+      (Optional) Bucket prefix for static assets that live outside of the
+      pipeline (e.g. data for seeding)
+    Default: ""
+  InstanceVolumeSize:
+    Type: Number
+    Description: The volume size in GB
+    Default: 30
+  HomeFolder:
+    Type: String
+    Description: The home folder in the VSCodeInstance
+    Default: /gameday
+  DevServerBasePath:
+    Type: String
+    Description: The base path for the application to be added to nginx sites-available list for code-server
+    Default: app
+  DevServerPort:
+    Type: Number
+    Description: The port for the DevServer
+    Default: 8081
+  AssetZipS3Path:
+    Description: The S3 path holding the asset zip file to be copied into the home folder. To leave the empty, leave blank.
+    Type: String
+    Default: "ws-assets-prod-iad-r-pdx-f3b3f9f1a7d6a3d0/ad8fc86d-cd69-4e66-bbae-4c7c208d870e/mystic_code.zip"
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Instance Configuration
+        Parameters:
+          - InstanceVolumeSize
+      - Label:
+          default: Code Server Configuration
+        Parameters:
+          - HomeFolder
+          - AssetZipS3Path
+          - DevServerBasePath
+          - DevServerPort
+    ParameterLabels:
+      InstanceVolumeSize:
+        default: Attached volume size
+      HomeFolder:
+        default: Folder to open in code server when launching
+      DevServerBasePath:
+        default: BasePath where the application runs
+      DevServerPort:
+        default: Port where the application runs
+      AssetZipS3Path:
+        default: S3 path to the assets zip file
+Mappings:
+  Subnets:
+    VPC:
+      CIDR: 10.0.0.0/16
+    PublicOne:
+      CIDR: 10.0.1.0/24
+    PublicTwo:
+      CIDR: 10.0.2.0/24
+    PrivateOne:
+      CIDR: 10.0.3.0/24
+    PrivateTwo:
+      CIDR: 10.0.4.0/24
+  # aws ec2 describe-managed-prefix-lists  --region <REGION> | jq -r '.PrefixLists[] | select (.PrefixListName == "com.amazonaws.global.cloudfront.origin-facing") | .PrefixListId'
+  AWSRegions2PrefixListID:
+    ap-northeast-1:
+      PrefixList: pl-58a04531
+    ap-northeast-2:
+      PrefixList: pl-22a6434b
+    ap-south-1:
+      PrefixList: pl-9aa247f3
+    ap-southeast-1:
+      PrefixList: pl-31a34658
+    ap-southeast-2:
+      PrefixList: pl-b8a742d1
+    ca-central-1:
+      PrefixList: pl-38a64351
+    eu-central-1:
+      PrefixList: pl-a3a144ca
+    eu-north-1:
+      PrefixList: pl-fab65393
+    eu-west-1:
+      PrefixList: pl-4fa04526
+    eu-west-2:
+      PrefixList: pl-93a247fa
+    eu-west-3:
+      PrefixList: pl-75b1541c
+    sa-east-1:
+      PrefixList: pl-5da64334
+    us-east-1:
+      PrefixList: pl-3b927c52
+    us-east-2:
+      PrefixList: pl-b6a144df
+    us-west-1:
+      PrefixList: pl-4ea04527
+    us-west-2:
+      PrefixList: pl-82a045eb
+
+Resources:
+  # ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  # ? AWS GameDay Quests - Team Enable Resources                                                                                                               ?
+  # ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+  # ? ResourceLookupLambda..? AWS::IAM::Role              ? Execution role for the resource lookup Lambda                                                      ?
+  # ? ResourceLookupLambda  ? AWS::Lambda::Function       ? Lambda Function that looks up default resources in the account                                     ?
+  # ? ResourceLookup        ? Custom::ResourceLookup      ? Custom provisioning logic invoking the Resource Lookup                                             ?
+  # ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+
+  ResourceLookupLambdaRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      Security: resource '*' permissions are required for QDK access
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Description: Provides permissions for internally-invoked Lambda resources
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: "*"
+        - PolicyName: EC2Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeVpcEndpoints
+                  - ec2:DescribeVpcEndpointServices
+                  - ec2:DescribeVpcAttribute
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSecurityGroupRules
+                Resource: "*"
+
+  ResourceLookupLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      Security:
+        The function is not created within a VPC to reduce costs due to extra
+        infrastructure setup needed
+      Concurrency: Reserved concurrency is not used as executions vary based event size
+    Properties:
+      Description: Lookup resources
+      Handler: resource_lookup.lambda_handler
+      Runtime: python3.10
+      Timeout: "30"
+      Code:
+        S3Bucket: !Ref DeployAssetsBucket
+        S3Key: !Join
+          - ""
+          - - !Ref DeployAssetsKeyPrefix
+            - !Ref TeamLambdaSourceKey
+      Role: !GetAtt ResourceLookupLambdaRole.Arn
+
+  ResourceLookup:
+    Type: Custom::ResourceLookup
+    Properties:
+      ServiceToken: !GetAtt ResourceLookupLambda.Arn
+
+  CodeAssetParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /GameDay/CodeServerAsset/MysticCode
+      Type: String
+      Value: !Sub |
+        {"bucket" : "${StaticAssetsBucket}", "key" : "${StaticAssetsKeyPrefix}mystic_code.zip"}
+
+  ########### Task 3 Bucket ###########
+
+  UnicornBucket:
+    Type: "AWS::S3::Bucket"
+
+  ########### ECR Resources ###########
+  ECRRepo:
+    Type: "AWS::ECR::Repository"
+    Properties:
+      EmptyOnDelete: true
+      RepositoryName: "bedrock_app"
+
+  ContainerCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: "bedrock-gameday-cluster"
+
+  CwLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: "bedrock-gameday-log-group"
+
+  DefaultVpcLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                Resource: "*"
+
+  DefaultVpcLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: BedrockGDGetDefaultVpcId
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          ec2 = boto3.client('ec2')
+
+          def lambda_handler(event, context):
+              if 'RequestType' in event and event['RequestType'] == 'Create':
+                  vpc_id = get_default_vpc_id()
+                  subnets =  get_subnets_for_vpc(vpc_id)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'VpcId': vpc_id , "Subnets" : subnets}, '')
+              else:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {},'')
+
+          def get_default_vpc_id():
+              vpcs = ec2.describe_vpcs(Filters=[{'Name': 'is-default', 'Values': ['true']}])
+              vpcs = vpcs['Vpcs']
+              vpc_id = vpcs[0]['VpcId']
+              return vpc_id
+
+
+          def get_subnets_for_vpc(vpcId):
+              response = ec2.describe_subnets(
+                  Filters=[
+                      {
+                          'Name': 'vpc-id',
+                          'Values': [vpcId]
+                      }
+                  ]
+              )
+              subnet_ids = []
+              for subnet in response['Subnets']:
+                  subnet_ids.append(subnet['SubnetId'])
+              return subnet_ids
+      Description: Return default VPC ID and Subnets
+      Handler: index.lambda_handler
+      MemorySize: 512
+      Role: !GetAtt DefaultVpcLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 5
+  DefaultVpcFinder:
+    Type: Custom::ResourceForFindingDefaultVpc
+    Properties:
+      ServiceToken: !GetAtt DefaultVpcLambda.Arn
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "bedrock-gameday-ecs-task-execution-role"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+        - "arn:aws:iam::aws:policy/AmazonElasticContainerRegistryPublicReadOnly"
+        - "arn:aws:iam::aws:policy/AWSLambda_FullAccess"
+      Policies:
+        - PolicyName: BedrockFullAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: "*"
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "bedrock-gameday-ecs-task-role"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AWSGlueSchemaRegistryFullAccess"
+        - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+        - "arn:aws:iam::aws:policy/AWSLambda_FullAccess"
+      Policies:
+        - PolicyName: BedrockFullAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: "*"
+
+  BedrockAppTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: CwLogGroup
+    Properties:
+      cpu: 1 vCPU
+      memory: 3 GB
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !Ref TaskRole
+      ExecutionRoleArn: !Ref ExecutionRole
+      ContainerDefinitions:
+        - Name: bedrock-app
+          Image: "PLACEHOLDER"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref CwLogGroup
+              awslogs-stream-prefix: ecs
+
+  BedrockAppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: allow port 80 to bedrock app
+      GroupName: bedrock_app_sg
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: "80"
+          ToPort: "80"
+          CidrIp: "0.0.0.0/0"
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic by default
+          IpProtocol: "-1"
+      VpcId: !GetAtt DefaultVpcFinder.VpcId
+
+Outputs:
+  Task3Bucket:
+    Description: Task 3 Bucket
+    Value: !Ref UnicornBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-Task3Bucket

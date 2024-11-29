@@ -1,0 +1,809 @@
+# Copyright 2024 Amazon.com and its affiliates; all rights reserved.
+# This file is Amazon Web Services Content and may not be duplicated or distributed without permission.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Remote Code Server
+
+Parameters:
+  # These parameters are supplied by the Quests API when this template is deployed 
+  DeployAssetsBucket:
+    Description: The name of the S3 bucket where assets are stored
+    Type: String
+  DeployAssetsKeyPrefix:
+    Description: S3 key prefix where assets are stored
+    Type: String
+
+  # Additional parameters required by this template
+  QuestId:
+    Default: 46d1692a-ee27-45ff-9b9a-ea891e294dfb
+    Description: The ID assigned to this Quest
+    Type: String
+
+  TeamLambdaSourceKey:
+    Default: gdQuests-team-lambda-source.zip
+    Description: S3 key for the Lambda source code used by the team account for the Quest
+    Type: String
+  StaticAssetsBucket:
+    Type: String
+    Description: (Optional) Bucket for static assets that live outside of the pipeline (e.g. data for seeding)
+    Default: ''
+  StaticAssetsKeyPrefix:
+    Type: String
+    Description: (Optional) Bucket prefix for static assets that live outside of the pipeline (e.g. data for seeding)
+    Default: ''
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64'
+
+Mappings:
+  AWSRegions2PrefixListID:
+    ap-northeast-1:
+      PrefixList: pl-58a04531
+    ap-northeast-2:
+      PrefixList: pl-22a6434b
+    ap-south-1:
+      PrefixList: pl-9aa247f3
+    ap-southeast-1:
+      PrefixList: pl-31a34658
+    ap-southeast-2:
+      PrefixList: pl-b8a742d1
+    ca-central-1:
+      PrefixList: pl-38a64351
+    eu-central-1:
+      PrefixList: pl-a3a144ca
+    eu-north-1:
+      PrefixList: pl-fab65393
+    eu-west-1:
+      PrefixList: pl-4fa04526
+    eu-west-2:
+      PrefixList: pl-93a247fa
+    eu-west-3:
+      PrefixList: pl-75b1541c
+    sa-east-1:
+      PrefixList: pl-5da64334
+    us-east-1:
+      PrefixList: pl-3b927c52
+    us-east-2:
+      PrefixList: pl-b6a144df
+    us-west-1:
+      PrefixList: pl-4ea04527
+    us-west-2:
+      PrefixList: pl-82a045eb
+
+Resources: 
+
+  ResourceLookupLambdaRole:
+    Type: "AWS::IAM::Role"
+    Metadata:
+      Security: "resource '*' permissions are required for QDK access"
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Description: Provides permissions for internally-invoked Lambda resources
+      Policies:
+      - PolicyName: CloudWatchLogsPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            - logs:DescribeLogStreams
+            Resource: "*"
+      - PolicyName: EC2Policy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - ec2:DescribeVpcs
+            - ec2:DescribeVpcEndpoints
+            - ec2:DescribeVpcEndpointServices
+            - ec2:DescribeVpcAttribute
+            - ec2:DescribeSubnets
+            - ec2:DescribeRouteTables
+            - ec2:DescribeSecurityGroups
+            - ec2:DescribeSecurityGroupRules
+            Resource: "*"
+
+  ResourceLookupLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      Security: The function is not created within a VPC to reduce costs due to extra infrastructure setup needed
+      Concurrency: Reserved concurrency is not used as executions vary based event size
+    Properties:
+      Description: Lookup resources
+      Handler: "resource_lookup.lambda_handler"
+      Runtime: python3.12
+      Timeout: '30'
+      Code:
+        S3Bucket: !Ref DeployAssetsBucket
+        S3Key: !Join
+          - ''
+          - - !Ref DeployAssetsKeyPrefix
+            - !Ref TeamLambdaSourceKey
+      Role: !GetAtt ResourceLookupLambdaRole.Arn
+
+  ResourceLookup:
+    Type: Custom::ResourceLookup
+    Properties:
+      ServiceToken: !GetAtt ResourceLookupLambda.Arn
+      ServiceTimeout: 300
+
+  SecretsManagerCodeServerPassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: gdQuests/CodeServer/user_credentials
+      Description: The secret used to log into the code server
+      GenerateSecretString:
+        ExcludePunctuation: true
+
+  SecretsManagerGiteaUnicornUserPassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: gdQuests/GiteaServer/unicorn_user_password
+      Description: The password for the unicorn user on the gitea server
+      GenerateSecretString:
+        ExcludePunctuation: true
+        PasswordLength: 8
+
+  SecretsManagerGiteaUrl:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: gdQuests/GiteaServer/gitea_url
+      Description: URL of our gitea server
+      SecretString: !Sub https://${CloudFrontDistributionVSCode.DomainName}/
+
+  VSCodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for Developer Machine - only allow CloudFront ingress
+      SecurityGroupIngress:
+        - Description: Allow HTTP from com.amazonaws.global.cloudfront.origin-facing
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId:  !FindInMap [AWSRegions2PrefixListID, !Ref 'AWS::Region', PrefixList]
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 9000
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - Description: Allow all outbound traffic
+          IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      VpcId: !GetAtt ResourceLookup.VpcId
+
+  ########### SSM Resources ###########
+  SSMLogBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: Access logs aren't needed for this bucket
+    DeletionPolicy: Delete
+    Properties:
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  VSCodeInstanceSSMDoc:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      Content:
+        schemaVersion: '2.2'
+        description: Bootstrap VSCode code-server instance
+        parameters:
+          architecture:
+            type: String
+            default: amd64
+            description: Instance architecture type
+            allowedValues:
+              - amd64
+          ubuntuVersion:
+            type: String
+            default: jammy
+            allowedValues:
+              - jammy
+          nodeVersion:
+            type: String
+            default: node_20.x
+            allowedValues:
+              - node_21.x
+              - node_20.x
+        mainSteps:
+          - action: aws:runShellScript
+            name: AWSProfile
+            inputs:
+              runCommand:
+                - mkdir -p /home/ubuntu/.aws
+                - !Sub |
+                  sudo tee /home/ubuntu/.aws/config <<EOF
+                  [default]
+                  output=json
+                  region=${AWS::Region}
+                  EOF
+                - touch /home/ubuntu/.aws/credentials
+                - sudo chown ubuntu:ubuntu /home/ubuntu/.aws -R
+          - action: aws:runShellScript
+            name: InstallAWSCLI
+            inputs:
+              runCommand:
+                - if [ -f /etc/vscode_complete_InstallAWSCLI ]; then exit 0; fi
+                - apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl unzip zip
+                - curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip -o /tmp/aws-cli.zip
+                - unzip -q -d /tmp /tmp/aws-cli.zip
+                - sudo /tmp/aws/install
+                - rm -rf /tmp/aws
+                - aws --version
+                - touch /etc/vscode_complete_InstallAWSCLI
+          - action: aws:runShellScript
+            name: InstallDocker
+            inputs:
+              runCommand:
+                - if [ -f /etc/vscode_complete_InstallDocker ]; then exit 0; fi
+                - apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release
+                - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+                - echo "deb [signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu {{ ubuntuVersion }} stable" >> /etc/apt/sources.list.d/docker.list
+                - apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io
+                - usermod -aG docker ubuntu
+                - docker --version
+                - touch /etc/vscode_complete_InstallDocker
+          - action: aws:runShellScript
+            name: InstallGit
+            inputs:
+              runCommand:
+                - if [ -f /etc/vscode_complete_InstallGit ]; then exit 0; fi
+                - add-apt-repository ppa:git-core/ppa
+                - apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common
+                - apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y git
+                - sudo -u ubuntu git config --global user.email "operator@unicornrentals.net"
+                - sudo -u ubuntu git config --global user.name "QDK Developer"
+                - sudo -u ubuntu git config --global init.defaultBranch "main"
+                - sudo -u ubuntu git config --global credential.helper store
+                - git --version
+                - touch /etc/vscode_complete_InstallGit
+          - action: aws:runShellScript
+            name: InstallNode
+            inputs:
+              runCommand:
+                - if [ -f /etc/vscode_complete_InstallNode ]; then exit 0; fi
+                - curl -fsSL https://deb.nodesource.com/gpgkey/nodesource.gpg.key | gpg --dearmor -o /usr/share/keyrings/nodesource-keyring.gpg
+                - echo "deb [arch={{ architecture }} signed-by=/usr/share/keyrings/nodesource-keyring.gpg] https://deb.nodesource.com/{{ nodeVersion }} {{ ubuntuVersion }} main" >> /etc/apt/sources.list.d/nodesource.list
+                - apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
+                - touch /etc/vscode_complete_InstallNode
+          - action: aws:runShellScript
+            name: InstallPython
+            inputs:
+              runCommand:
+                - if [ -f /etc/vscode_complete_InstallPython ]; then exit 0; fi
+                - apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip python3.10-venv python3-boto3 python3-pytest
+                - echo 'alias pytest=pytest-3' >> /home/ubuntu/.bashrc
+                - python3 --version
+                - sudo -u ubuntu pip3 install gitpython
+                - pip3 --version
+                - touch /etc/vscode_complete_InstallPython
+          - action: aws:runShellScript
+            name: InstallGitRemote
+            inputs:
+              runCommand:
+                - '#!/bin/bash'
+                - if [ -f /etc/vscode_complete_InstallGitRemote ]; then exit 0; fi
+                - pip3 install git-remote-codecommit
+                - touch /etc/vscode_complete_InstallGitRemote
+          - action: aws:runShellScript
+            name: InstallPythonRequirements
+            inputs:
+              runCommand:
+                - '#!/bin/bash'
+                - if [ -f /etc/vscode_complete_InstallPythonRequirements ]; then exit 0; fi
+                - mkdir -p /home/ubuntu/environment # should already exist!
+                - sudo chown ubuntu:ubuntu /home/ubuntu/environment -R
+                - touch /etc/vscode_complete_InstallPythonRequirements
+          - action: aws:runShellScript
+            name: UpdateProfile
+            inputs:
+              runCommand:
+                - '#!/bin/bash'
+                - if [ -f /etc/vscode_complete_UpdateProfile ]; then exit 0; fi
+                - echo LANG=en_US.utf-8 >> /etc/environment
+                - echo LC_ALL=en_US.UTF-8 >> /etc/environment
+                - echo 'PATH=$PATH:/home/ubuntu/.local/bin' >> /home/ubuntu/.bashrc
+                - echo 'export PATH' >> /home/ubuntu/.bashrc
+                - !Sub echo 'export AWS_REGION=${AWS::Region}' >> /home/ubuntu/.bashrc
+                - !Sub echo 'export AWS_ACCOUNTID=${AWS::AccountId}' >> /home/ubuntu/.bashrc
+                - echo 'export NEXT_TELEMETRY_DISABLED=1' >> /home/ubuntu/.bashrc
+                - touch /etc/vscode_complete_UpdateProfile
+          - action: aws:runShellScript
+            name: ConfigureCodeServer
+            inputs:
+              runCommand:
+                - '#!/bin/bash'
+                - if [ -f /etc/vscode_complete_ConfigureCodeServer ]; then exit 0; fi
+                - export HOME=/home/ubuntu
+                - apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
+                - curl -fsSL https://code-server.dev/install.sh | sh
+                - sudo systemctl enable --now code-server@ubuntu
+                - !Sub |
+                  sudo tee /etc/nginx/sites-available/code-server <<EOF
+                  server {
+                      listen 80;
+                      listen [::]:80;
+                      server_name ${CloudFrontDistributionVSCode.DomainName};
+                      location ~ ^/(.*) {
+                          client_max_body_size 512M;
+                          rewrite  ^/vscode/(.*) /\$1 break;
+                          proxy_pass http://127.0.0.1:8080;
+                          proxy_set_header Connection \$http_connection;
+                          proxy_set_header Upgrade \$http_upgrade;
+                          proxy_set_header Host \$host;
+                          proxy_set_header X-Real-IP \$remote_addr;
+                      }
+                      location /app {
+                        proxy_pass http://localhost:8081/app;
+                        proxy_set_header Host \$host;
+                        proxy_set_header Upgrade \$http_upgrade;
+                        proxy_set_header Connection upgrade;
+                        proxy_set_header Accept-Encoding gzip;
+                      }
+                  }
+                  EOF
+                - |
+                  sudo tee /home/ubuntu/.config/code-server/config.yaml <<EOF
+                  cert: false
+                  auth: password
+                  hashed-password: "$(echo -n $(aws secretsmanager get-secret-value --secret-id gdQuests/CodeServer/user_credentials  --query 'SecretString' --output text) | sudo npx argon2-cli -e)"
+                  EOF
+                - sudo -u ubuntu --login mkdir -p /home/ubuntu/.local/share/code-server/User/
+                - sudo -u ubuntu --login touch /home/ubuntu/.local/share/code-server/User/settings.json
+                - !Sub |
+                  sudo tee /home/ubuntu/.local/share/code-server/User/settings.json <<EOF
+                  {
+                    "extensions.autoUpdate": false,
+                    "extensions.autoCheckUpdates": false,
+                    "terminal.integrated.cwd": "/home/ubuntu/environment",
+                    "telemetry.telemetryLevel": "off",
+                    "security.workspace.trust.startupPrompt": "never",
+                    "security.workspace.trust.enabled": false,
+                    "security.workspace.trust.banner": "never",
+                    "security.workspace.trust.emptyWindow": false,
+                    "editor.tabSize": 2,
+                    "python.testing.pytestEnabled": true,
+                    "auto-run-command.rules": [
+                      {
+                        "command": "workbench.action.terminal.new"
+                      }
+                    ]
+                  }
+                  EOF
+                - sudo systemctl restart code-server@ubuntu
+                - sudo ln -s ../sites-available/code-server /etc/nginx/sites-enabled/code-server
+                - sudo systemctl restart nginx
+                - sudo -u ubuntu --login code-server --install-extension synedra.auto-run-command --force
+                - sudo chown ubuntu:ubuntu /home/ubuntu -R
+                - touch /etc/vscode_complete_ConfigureCodeServer
+          - action: aws:runShellScript
+            name: InstallQDeveloperExtension
+            inputs:
+              runCommand:
+                - if [ -f /etc/vscode_complete_InstallQDeveloperExtension ]; then exit 0; fi
+                - apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl jq
+                - |
+                  Q_URL=$(curl -sL https://api.github.com/repos/aws/aws-toolkit-vscode/releases/latest | jq -r '.assets[] | select(.name? | match("amazon-q-vscode-[0-9].[0-9].[0-9]*.vsix$";"g")) | .browser_download_url')
+                  if [ -z "$Q_URL" ];
+                  then
+                    echo 'No Q url found, using default'
+                    Q_URL=https://github.com/aws/aws-toolkit-vscode/releases/download/amazonq/v1.3.0/amazon-q-vscode-1.3.0.vsix
+                  fi
+                  echo 'Hardcoding add-in version'
+                  Q_URL=https://github.com/aws/aws-toolkit-vscode/releases/download/amazonq/v1.3.0/amazon-q-vscode-1.3.0.vsix
+                  echo $Q_URL
+                  curl -fsSL $Q_URL -o /tmp/AmazonWebServices.amazon-q-vscode.vsix
+                  sudo -u ubuntu --login code-server --install-extension /tmp/AmazonWebServices.amazon-q-vscode.vsix --force
+                  sudo touch /etc/vscode_complete_InstallQDeveloperExtension
+
+
+  GiteaInstanceSSMDoc:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      Content:
+        schemaVersion: '2.2'
+        description: Bootstrap Gitea instance
+        mainSteps:
+          - action: aws:runShellScript
+            name: AWSProfile
+            inputs:
+              runCommand:
+                - mkdir -p /home/ubuntu/environment && chown ubuntu:ubuntu /home/ubuntu/environment
+                - wget https://ws-assets-prod-iad-r-iad-ed304a55c2ca1aee.s3.us-east-1.amazonaws.com/46d1692a-ee27-45ff-9b9a-ea891e294dfb/tools/setup-gitea.sh -O /tmp/setup-gitea.sh
+                - cd /tmp && chmod +x setup-gitea.sh
+                - !Sub |
+                  export CLOUDFRONT_DOMAIN=${CloudFrontDistributionVSCode.DomainName}
+                - !Sub |
+                  export AWS_DEFAULT_REGION=${AWS::Region}
+                - ./setup-gitea.sh                
+
+  VSCodeInstanceSSMAssociation:
+    Type: AWS::SSM::Association
+    DependsOn: VSCodeInstanceEC2Instance
+    Properties:
+      Name: !Ref VSCodeInstanceSSMDoc
+      ScheduleExpression: rate(30 minutes)
+      OutputLocation:
+        S3Location:
+          OutputS3BucketName: !Ref SSMLogBucket
+          OutputS3KeyPrefix: bootstrap
+      Targets:
+        - Key: tag:QDKCodeServer
+          Values: [True]
+
+  GiteaInstanceSSMAssociation:
+    Type: AWS::SSM::Association
+    DependsOn: GiteaInstanceEC2Instance
+    Properties:
+      Name: !Ref GiteaInstanceSSMDoc
+      #ScheduleExpression: rate(30 minutes)
+      OutputLocation:
+        S3Location:
+          OutputS3BucketName: !Ref SSMLogBucket
+          OutputS3KeyPrefix: bootstrap
+      Targets:
+        - Key: tag:QDKGiteaServer
+          Values: [True]
+
+### Empty S3 bucket resources ###
+  EmptyS3BucketExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EmptyS3BucketPolicy-Code-Server
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !Join [ '', [ 'arn:aws:s3:::', !Ref SSMLogBucket, '/*' ] ]
+                  - !Join [ '', [ 'arn:aws:s3:::', !Ref SSMLogBucket ] ]
+
+  EmptyS3Bucket:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: EmptyS3BucketExecutionRole has the AWSLambdaBasicExecutionRole managed policy attached, allowing writing to CloudWatch logs
+          - id: W89
+            reason: Bootstrap function does not need the scaffolding of a VPC or provisioned concurrency
+          - id: W92
+            reason: Bootstrap function does not need provisioned concurrency
+    Properties:
+      Description: Empty S3 bucket CloudFormation custom resource
+      Handler: index.lambda_handler
+      Role:
+        Fn::GetAtt:
+          - EmptyS3BucketExecutionRole
+          - Arn
+      Runtime: python3.11
+      MemorySize: 1024
+      Timeout: 400
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import logging
+
+          logger = logging.getLogger(__name__)
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info('event: {}'.format(event))
+              logger.info('context: {}'.format(context))
+
+              if event['RequestType'] == 'Delete':
+                  try:
+                      AssetsBucketName = (event['ResourceProperties']['S3Bucket'])
+                      s3 = boto3.resource('s3')
+                      logger.info('S3 Object initialized')
+                      bucket = s3.Bucket(AssetsBucketName)
+                      logger.info('S3 bucket: ' + AssetsBucketName)
+                      bucket.objects.all().delete()
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData={}, reason='S3 bucket emptied: ' + AssetsBucketName )
+                  except Exception as e:
+                      logger.error(e, exc_info=True)
+                      cfnresponse.send(event, context, cfnresponse.FAILED, responseData={}, reason=str(e))
+              else:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData={}, reason='No action to take')
+
+  EmptyS3BucketLogGroup:
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: KMS Key not required for encrypting this non sensitive data
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${EmptyS3Bucket}
+      RetentionInDays: 7
+
+  EmptyS3BucketCustomResource:
+      Type: Custom::EmptyS3Bucket
+      Properties:
+          ServiceToken: !GetAtt EmptyS3Bucket.Arn
+          S3Bucket: !Ref SSMLogBucket
+
+  ########### EC2 Resources ###########
+  VSCodeInstanceRole:
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: CodeWhisperer requires '*' as a resource, reference https://docs.aws.amazon.com/codewhisperer/latest/userguide/cloud9-setup.html#codewhisperer-IAM-policies
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - ssm.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess
+      Policies:
+        - PolicyName: !Sub Codewhisperer-${AWS::Region}
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codewhisperer:GenerateRecommendations
+                Resource: '*'
+
+  VSCodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref VSCodeInstanceRole
+
+  VSCodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: !GetAtt VSCodeInstanceProfile.Arn
+        ImageId: >-
+          {{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id}}
+        InstanceType: 't3.medium'
+        BlockDeviceMappings:
+          - Ebs:
+              VolumeSize: 30
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+            DeviceName: /dev/sda1
+        UserData:
+          Fn::Base64: !Sub |
+            #cloud-config
+            hostname: dev
+            runcmd:
+              - mkdir -p /home/ubuntu/environment && chown ubuntu:ubuntu /home/ubuntu/environment
+              - echo ENVIRONMENT_ROOT=/home/ubuntu/environment >>  /etc/environment
+              - wget -O /usr/local/bin/sync_codepipeline_repos_git.py  "https://ws-assets-prod-iad-r-iad-ed304a55c2ca1aee.s3.us-east-1.amazonaws.com/46d1692a-ee27-45ff-9b9a-ea891e294dfb/tools/sync_codepipeline_repos_git.py"
+              - chmod 755 /usr/local/bin/sync_codepipeline_repos_git.py
+              - echo "*/5  *  * * *   ubuntu  /usr/local/bin/sync_codepipeline_repos_git.py" >> /etc/crontab
+              - sudo -u ubuntu pip install gitpython
+        SecurityGroupIds:
+          - !Ref VSCodeSecurityGroup
+        MetadataOptions:
+          HttpTokens: required
+      TagSpecifications:
+      - ResourceType: "launch-template"
+        Tags:
+        - Key: QDKCodeServer
+          Value: True
+        - Key: Name
+          Value: Code Server (DO NOT MODIFY)
+
+  VSCodeInstanceEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      DisableApiTermination: True
+      LaunchTemplate:
+        LaunchTemplateId: !Ref VSCodeLaunchTemplate
+        Version: 1
+      Tags:
+      - Key: QDKCodeServer
+        Value: True
+      - Key: Name
+        Value: Code Server (DO NOT MODIFY)
+
+  GiteaLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: !GetAtt VSCodeInstanceProfile.Arn
+        ImageId: >-
+          {{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id}}
+        InstanceType: 't3.small'
+        BlockDeviceMappings:
+          - Ebs:
+              VolumeSize: 30
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+            DeviceName: /dev/sda1
+        SecurityGroupIds:
+          - !Ref VSCodeSecurityGroup
+        MetadataOptions:
+          HttpTokens: required
+      TagSpecifications:
+      - ResourceType: "launch-template"
+        Tags:
+        - Key: Name
+          Value: Gitea Server (DO NOT MODIFY)
+        - Key: QDKGiteaServer
+          Value: True
+
+  GiteaInstanceEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      DisableApiTermination: True
+      LaunchTemplate:
+        LaunchTemplateId: !Ref GiteaLaunchTemplate
+        Version: 1
+      Tags:
+      - Key: Name
+        Value: Gitea Server (DO NOT MODIFY)
+      - Key: QDKGiteaServer
+        Value: True
+
+  ########### CloudFront Resources ###########
+  VSCodeInstanceCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        DefaultTTL: 86400
+        MaxTTL: 31536000
+        MinTTL: 1
+        Name: codeServerCachePolicy
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: all
+          EnableAcceptEncodingGzip: False
+          HeadersConfig:
+            HeaderBehavior: whitelist
+            Headers:
+              - Accept-Charset
+              - Authorization
+              - Origin
+              - Accept
+              - Referer
+              - Host
+              - Accept-Language
+              - Accept-Encoding
+              - Accept-Datetime
+          QueryStringsConfig:
+            QueryStringBehavior: all
+
+  CloudFrontDistributionVSCode:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: True
+        CacheBehaviors:
+        - AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - PATCH
+            - POST
+            - DELETE
+          TargetOriginId: !Sub CloudFront-${AWS::StackName}
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+          CachePolicyId: !Ref VSCodeInstanceCachePolicy
+          ViewerProtocolPolicy: allow-all
+          PathPattern: /vscode*
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - PATCH
+            - POST
+            - DELETE
+          CachePolicyId: !Ref VSCodeInstanceCachePolicy
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3 # Managed-AllViewer - see https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-origin-request-policies.html#:~:text=When%20using%20AWS,47e4%2Db989%2D5492eafa07d3
+          TargetOriginId: !Sub CloudFront-Gitea-${AWS::StackName}
+          ViewerProtocolPolicy: allow-all
+        Origins:
+          - DomainName: !GetAtt VSCodeInstanceEC2Instance.PublicDnsName
+            Id: !Sub CloudFront-${AWS::StackName}
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+          - DomainName: !GetAtt GiteaInstanceEC2Instance.PublicDnsName
+            Id: !Sub CloudFront-Gitea-${AWS::StackName}
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+
+Outputs:
+  CodeServerURL:
+    Description: Code-Server URL
+    Value: !Sub https://${CloudFrontDistributionVSCode.DomainName}/vscode/login
+    Export:
+      Name: !Sub ${AWS::StackName}-CodeServerURL
+  GiteaServerURL:
+    Description: Gitea Server URL
+    Value: !Sub https://${CloudFrontDistributionVSCode.DomainName}/
+    Export:
+      Name: !Sub ${AWS::StackName}-GiteaServerURL
+
+  # This section modifies the team's TeamRole IAM role to restrict the listed actions on the specified resources.
+  # The purpose is to avoid that a team cheats by picking into or execute resources they shouldn't be able to manipulate
+  QuestsResourceLocks:
+    Description: A JSON object that defines what IAM actions to restrict as a result of deploying this template
+    Value: !Sub |-
+      [
+        {
+          "Actions": [
+            "lambda:DeleteFunction",
+            "lambda:GetFunction",
+            "lambda:InvokeFunction",
+            "lambda:PublishVersion",
+            "lambda:RemovePermission",
+            "lambda:UpdateFunctionCode",
+            "lambda:UpdateFunctionConfiguration",
+            "lambda:UpdateFunctionUrlConfig",
+            "lambda:UpdateFunctionEventInvokeConfig"
+          ],
+          "Resources": [
+            "${ResourceLookupLambda.Arn}"
+          ]
+        },
+        {
+          "Actions": [
+            "ec2:TerminateInstances"
+          ],
+          "Resources": [
+            "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${VSCodeInstanceEC2Instance}"
+          ]
+        }
+      ]

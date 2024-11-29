@@ -1,0 +1,473 @@
+# Copyright 2022 Amazon.com and its affiliates; all rights reserved.
+# This file is Amazon Web Services Content and may not be duplicated or distributed without permission.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Reference Quest - Team
+
+Parameters:
+  # These parameters are supplied by the Quests API when this template is deployed 
+  DeployAssetsBucket:
+    # Default: ee-assets-prod-us-east-1
+    Description: The name of the S3 bucket where assets are stored
+    Type: String
+  DeployAssetsKeyPrefix:
+    # Default: modules/9c0e89820b864addaed45ec2f5440379/v5/
+    Description: S3 key prefix where assets are stored
+    Type: String
+
+  # Additional parameters required by this template
+  QuestId:
+    Default: dbbcd2a9-50da-4d26-85a5-7ced55db49cb
+    Description: The ID assigned to this Quest
+    Type: String
+
+  TeamLambdaSourceKey:
+    Default: gdQuests-team-lambda-source.zip
+    Description: S3 key for the Lambda source code used by the team account for the Quest
+    Type: String
+  StaticAssetsBucket:
+    Type: String
+    Description: (Optional) Bucket for static assets that live outside of the pipeline (e.g. data for seeding)
+    Default: ''
+  StaticAssetsKeyPrefix:
+    Type: String
+    Description: (Optional) Bucket prefix for static assets that live outside of the pipeline (e.g. data for seeding)
+    Default: ''
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+Resources:
+  #S3 bucket
+  TempBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      NotificationConfiguration: 
+        EventBridgeConfiguration:
+          EventBridgeEnabled: True
+      PublicAccessBlockConfiguration: 
+          BlockPublicAcls: True
+          BlockPublicPolicy: True
+          IgnorePublicAcls: True
+          RestrictPublicBuckets: True
+  
+  #DynamoDB
+  TeamDDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        -
+          AttributeName: "call_analytics_job_name"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "call_analytics_job_name"
+          KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+
+  #Lambda IAM Role
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      - PolicyName: DynamoDBAccess
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - dynamodb:PutItem
+            Resource: !GetAtt TeamDDBTable.Arn
+      - PolicyName: BedrockAccess
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - bedrock:InvokeModel
+            - bedrock:InvokeModelWithResponseStream
+            Resource: "*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+  
+  #Lambda
+  BotoLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.9
+        - python3.10
+        - python3.11
+      Content:
+        S3Bucket: !Ref StaticAssetsBucket
+        S3Key: !Join
+          - ''
+          - - !Ref StaticAssetsKeyPrefix
+            - 'sdks/bedrock-1-28-57.zip'
+      Description: Boto3 layer
+      LayerName: boto3-layer
+
+  BedrockOrchestrator:
+    Type: AWS::Lambda::Function
+    Description: Bedrock Lambda Function
+    Properties:
+      Handler: "bedrock_orchestrator.lambda_handler"
+      Runtime: python3.9
+      Timeout: '300'
+      Code:
+        S3Bucket: !Ref DeployAssetsBucket
+        S3Key: !Join
+          - ''
+          - - !Ref DeployAssetsKeyPrefix
+            - !Ref TeamLambdaSourceKey
+      Environment:
+        Variables:
+          TEAM_DDB_TABLE: !Ref TeamDDBTable
+      Role: !GetAtt LambdaRole.Arn
+      Layers:
+        - !Ref BotoLayer
+
+
+  #Step Functions IAM Role
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - states.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      - PolicyName: CloudwatchAccess
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            - logs:CreateLogDelivery
+            - logs:GetLogDelivery
+            - logs:UpdateLogDelivery
+            - logs:DeleteLogDelivery
+            - logs:ListLogDeliveries
+            - logs:PutResourcePolicy
+            - logs:DescribeResourcePolicies
+            - logs:DescribeLogGroups
+            Resource: "*"
+      - PolicyName: XRayAccess
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - xray:PutTraceSegments
+            - xray:PutTelemetryRecords
+            - xray:GetSamplingRules
+            - xray:GetSamplingTargets
+            Resource: "*"
+      - PolicyName: LambdaAccess
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - lambda:InvokeFunction
+            Resource: 
+              !Join
+                - ":" 
+                - - !GetAtt BedrockOrchestrator.Arn 
+                  - "*" 
+      - PolicyName: TranscribeAccess
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - transcribe:GetCallAnalyticsJob
+            - transcribe:StartCallAnalyticsJob
+            Resource: "*"
+      - PolicyName: PassRole
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - iam:PassRole
+            Resource: !GetAtt TranscribeIAMRole.Arn
+      - PolicyName: S3Access
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource: 
+              - !Sub arn:aws:s3:::${TempBucket}/*
+              - !Sub arn:aws:s3:::${TempBucket}
+
+  #Step Functions
+  TranscriptionOrchestrator:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+        DefinitionString: 
+          !Sub
+            - |-
+              {
+                "Comment": "A State Machine that process a video file",
+                "StartAt": "StartTranscriptionJob",
+                "States": {
+                  "StartTranscriptionJob": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:transcribe:startCallAnalyticsJob",
+                    "Parameters": {
+                      "Media": {
+                        "MediaFileUri.$": "States.Format('s3://{}/{}',$.detail.bucket.name,$.detail.object.key)"
+                      },
+                      "CallAnalyticsJobName.$": "$$.Execution.Name",
+                      "ChannelDefinitions": [
+                        {
+                          "ChannelId": 0,
+                          "ParticipantRole": "AGENT"
+                        },
+                        {
+                          "ChannelId": 1,
+                          "ParticipantRole": "CUSTOMER"
+                        }
+                      ],
+                      "DataAccessRoleArn": "${TranscribeIAMRoleArn}",
+                      "OutputLocation.$": "States.Format('s3://{}/outputs/{}_call-transcribe.json', $.detail.bucket.name, $$.Execution.Name)",
+                      "Settings": {
+                        "LanguageOptions": [
+                          "en-US"
+                        ]
+                      }
+                    },
+                    "ResultPath": "$.transcription",
+                    "Next": "Wait20Seconds"
+                  },
+                  "Wait20Seconds": {
+                    "Type": "Wait",
+                    "Seconds": 20,
+                    "Next": "CheckIfTranscriptionDone"
+                  },
+                  "CheckIfTranscriptionDone": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:transcribe:getCallAnalyticsJob",
+                    "Parameters": {
+                      "CallAnalyticsJobName.$": "$.transcription.CallAnalyticsJob.CallAnalyticsJobName"
+                    },
+                    "ResultPath": "$.transcription",
+                    "Next": "IsTranscriptionDone?"
+                  },
+                  "IsTranscriptionDone?": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "Variable": "$.transcription.CallAnalyticsJob.CallAnalyticsJobStatus",
+                        "StringEquals": "COMPLETED",
+                        "Next": "GetTranscriptionText"
+                      }
+                    ],
+                    "Default": "Wait20Seconds"
+                  },
+                  "GetTranscriptionText": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+                    "Parameters": {
+                      "Bucket.$": "$.detail.bucket.name",
+                      "Key.$": "States.Format('outputs/{}_call-transcribe.json', $$.Execution.Name)"
+                    },
+                    "ResultSelector": {
+                      "filecontent.$": "States.StringToJson($.Body)"
+                    },
+                    "ResultPath": "$.transcription",
+                    "Next": "Lambda Invoke"
+                  },
+                  "Lambda Invoke": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "OutputPath": "$.Payload",
+                    "Parameters": {
+                      "Payload.$": "$.transcription.filecontent",
+                      "FunctionName": "${BedrockOrchestratorArn}:$LATEST"
+                    },
+                    "Retry": [
+                      {
+                        "ErrorEquals": [
+                          "Lambda.ServiceException",
+                          "Lambda.AWSLambdaException",
+                          "Lambda.SdkClientException",
+                          "Lambda.TooManyRequestsException"
+                        ],
+                        "IntervalSeconds": 1,
+                        "MaxAttempts": 3,
+                        "BackoffRate": 2
+                      }
+                    ],
+                    "End": true
+                  }
+                }
+              }
+            - TranscribeIAMRoleArn: !GetAtt TranscribeIAMRole.Arn
+              BedrockOrchestratorArn: !GetAtt BedrockOrchestrator.Arn
+        RoleArn: !GetAtt StepFunctionsRole.Arn
+    DependsOn:
+      - BedrockOrchestrator
+      - TranscribeIAMRole
+  
+  #Eventbridge IAM role
+  EventbridgeIAMRole:
+    Type: "AWS::IAM::Role"
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - events.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      - PolicyName: StateMachineExecutePolicy
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - states:StartExecution
+            Resource: 
+            - !GetAtt TranscriptionOrchestrator.Arn
+
+  #Eventbridge rule
+  Eventbridgerule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: default
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Sub ${TempBucket}
+          object:
+            key:
+              - prefix: automation/inputs/
+      State: ENABLED
+      Targets:
+        - Id: TargetStateMachine
+          Arn: !GetAtt TranscriptionOrchestrator.Arn 
+          RoleArn: !GetAtt EventbridgeIAMRole.Arn
+  
+  #transcribe service role
+  TranscribeIAMRole:
+      Type: "AWS::IAM::Role"
+      Properties: 
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - transcribe.amazonaws.com
+            Action:
+            - sts:AssumeRole
+        Policies:
+        - PolicyName: transcribepolicy
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+              Resource: 
+              - !Sub arn:aws:s3:::${TempBucket}/*
+              - !Sub arn:aws:s3:::${TempBucket}
+
+Outputs:
+  TeamBucket:
+    Description: The S3 bucket for the team
+    Value: !Ref TempBucket
+
+  TeamTable:
+    Description: The DDB table for the team
+    Value: !Ref TeamDDBTable
+  
+  TeamSFN:
+    Description: The ARN of the Step Function
+    Value: !GetAtt TranscriptionOrchestrator.Arn
+  
+  TeamLambda:
+    Description: The ARN of the Bedrock Orchestrator Lambda Function
+    Value: !Ref BedrockOrchestrator
+  
+  # This section modifies the team's TeamRole IAM role to restrict the listed actions on the specified resources.
+  # The purpose is to avoid that a team cheats by picking into or execute resources they shouldn't be able to manipulate
+  QuestsResourceLocks:
+    Description: A JSON object that defines what IAM actions to restrict as a result of deploying this template
+    Value: !Sub |-
+      [
+        {
+          "Actions": [
+            "s3:DeleteBucket"
+          ],
+          "Resources": [
+            "${TempBucket.Arn}"
+          ]
+        },
+        {
+          "Actions": [
+            "dynamodb:DeleteTable"
+          ],
+          "Resources": [
+            "${TeamDDBTable.Arn}"
+          ]
+        },
+        {
+          "Actions": [
+            "stepfunctions:DeleteStateMachine"
+          ],
+          "Resources": [
+            "${TranscriptionOrchestrator.Arn}"
+          ]
+        },
+        {
+          "Actions": [
+            "lambda:DeleteFunction"
+          ],
+          "Resources": [
+            "${BedrockOrchestrator.Arn}"
+          ]
+        },
+        {
+          "Actions": [
+            "eventbridge:DeleteRule"
+          ],
+          "Resources": [
+            "${Eventbridgerule.Arn}"
+          ]
+        },
+        {
+          "Actions": [
+            "iam:DeleteRole"
+          ],
+          "Resources": [
+            "${LambdaRole.Arn}",
+            "${StepFunctionsRole.Arn}",
+            "${EventbridgeIAMRole.Arn}",
+            "${TranscribeIAMRole.Arn}"
+          ]
+        }
+      ]
