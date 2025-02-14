@@ -1,4 +1,4 @@
-# genai-unicorn-party-gameday-gitlab
+# genai-unicorn-party-gameday
 
 GenAI Unicorn Party GameDay assets and solutions.
 
