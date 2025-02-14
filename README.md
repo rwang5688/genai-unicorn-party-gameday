@@ -15,7 +15,7 @@ Already a pro? Just edit this README.md and make it your own. Want to make it ea
 
 ```
 cd existing_repo
-git remote add origin https://gitlab.aws.dev/wangrob/genai-unicorn-party-gameday-gitlab.git
+git remote add origin https://github.com/rwang5688/genai-unicorn-party-gameday.git
 git branch -M main
 git push -uf origin main
 ```
