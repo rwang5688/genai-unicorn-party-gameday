@@ -6,6 +6,6 @@ amazon-textract-caller==0.2.4
 amazon-textract-textractor==1.8.3
 langchain-aws==0.1.18
 langchain==0.2.16
-langchain_community==0.2.17
+langchain_community==0.3.27
 anthropic==0.34.2
 pydantic==1.10.13
